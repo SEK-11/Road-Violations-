@@ -1,1 +1,0 @@
-def pali(n)
