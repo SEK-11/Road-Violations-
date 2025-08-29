@@ -1,0 +1,2 @@
+python3 /home/vmukti/Downloads/Manus_traffic/main_app.py --source /home/vmukti/Downloads/Manus_traffic/tr.mp4 --config config.json
+python3 simple_zone_drawer.py --source /home/vmukti/Downloads/Manus_traffic/dataset/Parking.mp4 --output config.json

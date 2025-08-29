@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""
+Real-time Traffic Violation Detection System - Main Application
+Author: Manus AI
+Date: July 15, 2025
+
+Main application that integrates all components for real-time traffic violation detection.
+"""
+
+import cv2
+import numpy as np
+import time
+import json
+import logging
+import threading
+import queue
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional, Any
+from pathlib import Path
+import argparse
+import os
+
+# Import our modules
+from traffic_violation_detector import (
+    VideoProcessor, ObjectDetector, MultiObjectTracker, ZoneManager,
+    DetectionResult, ViolationEvent
+)
+from violation_detectors import get_all_violations, VIOLATION_DETECTORS
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class TrafficViolationSystem:
+    """Main traffic violation detection system"""
+    
+    def __init__(self, video_source: str = 0, config_file: str = None):
+        """Initialize the traffic violation detection system"""
+        self.video_source = video_source
+        self.config_file = config_file
+        
+        # Initialize components
+        self.video_processor = VideoProcessor(video_source)
+        self.object_detector = ObjectDetector()
+        self.tracker = MultiObjectTracker()
+        self.zone_manager = ZoneManager()
+        
+        # System state
+        self.running = False
+        self.frame_count = 0
+        self.fps_counter = 0
+        self.last_fps_time = time.time()
+        self.current_fps = 0
+        
+        # Violation storage
+        self.violations = []
+        self.violation_queue = queue.Queue()
+        
+        # Performance metrics
+        self.detection_times = []
+        self.total_violations = 0
+        
+        # Create violations output directory with today's date
+        today_date = datetime.now().strftime('%Y-%m-%d')
+        self.violations_dir = Path("/home/vmukti/Downloads/Manus_traffic/violations_output") / today_date
+        try:
+            if self.violations_dir.exists() and not self.violations_dir.is_dir():
+                os.remove(str(self.violations_dir))
+            self.violations_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create subdirectories for each violation type
+            self.violation_subdirs = {
+                "red_light_violation": self.violations_dir / "red_light_violation",
+                "wrong_side_driving": self.violations_dir / "wrong_side_driving",
+                "heavy_vehicle_prohibition": self.violations_dir / "heavy_vehicle_prohibition",
+                "parking_violation": self.violations_dir / "parking_violation",
+                "lane_change_violation": self.violations_dir / "lane_change_violation"
+            }
+            
+            for subdir in self.violation_subdirs.values():
+                subdir.mkdir(exist_ok=True)
+                
+            logger.info(f"Violation images will be saved to: {self.violations_dir}")
+        except Exception as e:
+            logger.error(f"Error creating violations directory: {e}")
+            # Fallback to current directory with date
+            today_date = datetime.now().strftime('%Y-%m-%d')
+            self.violations_dir = Path("./violations_output") / today_date
+            self.violations_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create subdirectories in fallback location
+            self.violation_subdirs = {
+                "red_light_violation": self.violations_dir / "red_light_violation",
+                "wrong_side_driving": self.violations_dir / "wrong_side_driving",
+                "heavy_vehicle_prohibition": self.violations_dir / "heavy_vehicle_prohibition",
+                "parking_violation": self.violations_dir / "parking_violation",
+                "lane_change_violation": self.violations_dir / "lane_change_violation"
+            }
+            
+            for subdir in self.violation_subdirs.values():
+                subdir.mkdir(exist_ok=True)
+        
+        # Load configuration
+        self.load_configuration()
+        
+    def load_configuration(self):
+        """Load system configuration or create default zones"""
+        if self.config_file and Path(self.config_file).exists():
+            try:
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                self.apply_configuration(config)
+                logger.info(f"Configuration loaded from {self.config_file}")
+            except Exception as e:
+                logger.error(f"Error loading configuration: {e}")
+                self.create_default_zones()
+        else:
+            logger.info("No configuration file provided or file does not exist. Creating default zones.")
+            self.create_default_zones()
+    
+    def create_default_zones(self):
+        """Create default zones based on frame size"""
+        # Initialize video processor to get frame size
+        self.video_processor.initialize()
+        frame = self.video_processor.read_frame()
+        
+        if frame is None:
+            logger.error("Could not read frame to create default zones")
+            raise RuntimeError("Could not read frame to create default zones")
+        
+        height, width = frame.shape[:2]
+        
+        # Create default zones based on frame size
+        # Stop line zone (horizontal line across bottom third)
+        stop_line_y = int(height * 0.7)
+        self.zone_manager.add_zone(
+            "stop_line_1",
+            [(50, stop_line_y), (width-50, stop_line_y), (width-50, stop_line_y+10), (50, stop_line_y+10)],
+            "stop_line"
+        )
+        
+        # Lane zones (with direction in the name)
+        lane_width = int(width * 0.3)  # Narrower lanes
+        
+        # Right-going lane (top)
+        self.zone_manager.add_zone(
+            "lane_right",
+            [(50, height//2 - 50), (width-50, height//2 - 50),
+             (width-50, height//2 - 10), (50, height//2 - 10)],
+            "lane"
+        )
+        
+        # Left-going lane (bottom)
+        self.zone_manager.add_zone(
+            "lane_left",
+            [(width-50, height//2 + 10), (50, height//2 + 10),
+             (50, height//2 + 50), (width-50, height//2 + 50)],
+            "lane"
+        )
+        
+        # No parking zone (right side of frame)
+        self.zone_manager.add_zone(
+            "no_parking_1",
+            [(width-200, height//3), (width-50, height//3), 
+             (width-50, height-100), (width-200, height-100)],
+            "no_parking"
+        )
+        
+        # Heavy vehicle prohibited zone (top left of frame)
+        self.zone_manager.add_zone(
+            "heavy_vehicle_prohibited_1",
+            [(50, 50), (width//3, 50), 
+             (width//3, height//3), (50, height//3)],
+            "heavy_vehicle_prohibited"
+        )
+        
+        logger.info("Created default zones based on frame size")
+        
+        # Enable corresponding detectors based on zone types
+        if 'red_light' in VIOLATION_DETECTORS:
+            VIOLATION_DETECTORS['red_light'].enabled = True
+            logger.info("Enabled Red Light Violation detector")
+            
+        if 'wrong_side' in VIOLATION_DETECTORS:
+            VIOLATION_DETECTORS['wrong_side'].enabled = True
+            logger.info("Enabled Wrong Side Driving detector")
+            
+        if 'heavy_vehicle' in VIOLATION_DETECTORS:
+            VIOLATION_DETECTORS['heavy_vehicle'].enabled = True
+            logger.info("Enabled Heavy Vehicle Prohibition detector")
+            
+        if 'parking' in VIOLATION_DETECTORS:
+            VIOLATION_DETECTORS['parking'].enabled = True
+            logger.info("Enabled Parking Violation detector")
+    
+    def apply_configuration(self, config: Dict):
+        """Apply configuration settings"""
+        # First, disable all detectors by default
+        for detector_name, detector in VIOLATION_DETECTORS.items():
+            detector.enabled = False
+            
+        # Apply zone configurations with scaling if needed
+        if 'zones' in config:
+            # Check if we need to scale zones based on frame dimensions
+            scale_x, scale_y = 1.0, 1.0
+            if 'frame_info' in config:
+                # Initialize video processor to get current frame size
+                self.video_processor.initialize()
+                frame = self.video_processor.read_frame()
+                
+                if frame is not None:
+                    current_height, current_width = frame.shape[:2]
+                    config_width = config['frame_info'].get('width', current_width)
+                    config_height = config['frame_info'].get('height', current_height)
+                    
+                    # Calculate scaling factors
+                    if config_width > 0 and config_height > 0:
+                        scale_x = current_width / config_width
+                        scale_y = current_height / config_height
+                        logger.info(f"Scaling zones: x={scale_x:.2f}, y={scale_y:.2f}")
+            
+            # Track which zone types are defined
+            defined_zone_types = set()
+            
+            # Add zones with scaling
+            for zone_config in config['zones']:
+                # Scale points if needed
+                scaled_points = []
+                for x, y in zone_config['points']:
+                    scaled_x = int(x * scale_x)
+                    scaled_y = int(y * scale_y)
+                    scaled_points.append((scaled_x, scaled_y))
+                
+                zone_type = zone_config['type']
+                self.zone_manager.add_zone(
+                    zone_config['id'],
+                    scaled_points,
+                    zone_type
+                )
+                
+                # Add to defined zone types
+                defined_zone_types.add(zone_type)
+            
+            # Enable only detectors for which zones are defined
+            if 'stop_line' in defined_zone_types:
+                if 'red_light' in VIOLATION_DETECTORS:
+                    VIOLATION_DETECTORS['red_light'].enabled = True
+                    logger.info("Enabled Red Light Violation detector")
+                    
+            if 'lane' in defined_zone_types:
+                if 'wrong_side' in VIOLATION_DETECTORS:
+                    VIOLATION_DETECTORS['wrong_side'].enabled = True
+                    logger.info("Enabled Wrong Side Driving detector")
+                    
+            if 'heavy_vehicle_prohibited' in defined_zone_types:
+                if 'heavy_vehicle' in VIOLATION_DETECTORS:
+                    VIOLATION_DETECTORS['heavy_vehicle'].enabled = True
+                    logger.info("Enabled Heavy Vehicle Prohibition detector")
+                    
+            if 'no_parking' in defined_zone_types:
+                if 'parking' in VIOLATION_DETECTORS:
+                    VIOLATION_DETECTORS['parking'].enabled = True
+                    logger.info("Enabled Parking Violation detector")
+        
+        # Apply explicit detector settings if provided
+        if 'detectors' in config:
+            for detector_name, settings in config['detectors'].items():
+                if detector_name in VIOLATION_DETECTORS:
+                    detector = VIOLATION_DETECTORS[detector_name]
+                    detector.enabled = settings.get('enabled', detector.enabled)
+                    # Apply other detector-specific settings
+    
+
+    
+    def initialize(self) -> bool:
+        """Initialize the system"""
+        logger.info("Initializing Traffic Violation Detection System...")
+        
+        # Initialize video processor
+        if not self.video_processor.initialize():
+            logger.error("Failed to initialize video processor")
+            return False
+        
+        logger.info("System initialized successfully")
+        return True
+    
+    def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[ViolationEvent]]:
+        """Process a single frame and return annotated frame with violations"""
+        start_time = time.time()
+        
+        # Detect objects
+        detections = self.object_detector.detect(frame)
+        
+        # Update tracker
+        tracked_detections = self.tracker.update(detections, frame)
+        
+        # Detect violations
+        violations = get_all_violations(
+            tracked_detections, 
+            frame, 
+            self.tracker.tracks, 
+            self.zone_manager
+        )
+        
+        # Store violations and save images
+        for violation in violations:
+            self.violations.append(violation)
+            self.violation_queue.put(violation)
+            self.total_violations += 1
+            
+            # Save violation image
+            for detection in tracked_detections:
+                if detection.track_id == violation.track_id:
+                    self.save_violation_image(frame, detection, violation)
+                    break
+        
+        # Annotate frame
+        annotated_frame = self.annotate_frame(frame, tracked_detections, violations)
+        
+        # Update performance metrics
+        processing_time = time.time() - start_time
+        self.detection_times.append(processing_time)
+        if len(self.detection_times) > 100:
+            self.detection_times = self.detection_times[-100:]
+        
+        return annotated_frame, violations
+        
+    def save_violation_image(self, frame: np.ndarray, detection: DetectionResult, violation: ViolationEvent):
+        """Save images of the violation to the appropriate folder"""
+        try:
+            # Create a timestamp for the filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            
+            # Get the appropriate directory for this violation type
+            violation_type = violation.violation_type
+            if violation_type in self.violation_subdirs:
+                save_dir = self.violation_subdirs[violation_type]
+            else:
+                save_dir = self.violations_dir
+            
+            # Get a clean copy of the frame without overlays
+            clean_frame = self.video_processor.get_current_frame_clean()
+            if clean_frame is None:
+                clean_frame = frame.copy()  # Fallback to the annotated frame
+            
+            # Extract vehicle from clean frame
+            x1, y1, x2, y2 = detection.bbox
+            # Add some margin
+            margin = 20
+            x1 = max(0, x1 - margin)
+            y1 = max(0, y1 - margin)
+            x2 = min(clean_frame.shape[1], x2 + margin)
+            y2 = min(clean_frame.shape[0], y2 + margin)
+            
+            vehicle_img = clean_frame[y1:y2, x1:x2].copy()
+            
+            # Create a minimally annotated frame for context
+            context_frame = clean_frame.copy()
+            cv2.rectangle(context_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            
+            # Add minimal violation info
+            violation_text = violation.violation_type.replace('_', ' ').title()
+            cv2.putText(context_frame, violation_text, (x1, y1 - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            # Save both images
+            vehicle_filename = f"{violation_type}_{timestamp}_vehicle_{detection.track_id}.jpg"
+            frame_filename = f"{violation_type}_{timestamp}_frame_{detection.track_id}.jpg"
+            
+            cv2.imwrite(str(save_dir / vehicle_filename), vehicle_img)
+            cv2.imwrite(str(save_dir / frame_filename), context_frame)
+            
+            logger.info(f"Saved {violation_type} images: {vehicle_filename} and {frame_filename}")
+        except Exception as e:
+            logger.error(f"Error saving violation image: {e}")
+    
+    def annotate_frame(self, frame: np.ndarray, detections: List[DetectionResult], 
+                      violations: List[ViolationEvent]) -> np.ndarray:
+        """Annotate frame with detection results and violations"""
+        annotated = frame.copy()
+        
+        # Draw zones
+        self.draw_zones(annotated)
+        
+        # Draw detections
+        for detection in detections:
+            self.draw_detection(annotated, detection)
+        
+        # Draw violations
+        for violation in violations:
+            self.draw_violation(annotated, violation)
+        
+        # Draw system info 
+        self.draw_system_info(annotated)
+        
+        return annotated
+    
+    def draw_zones(self, frame: np.ndarray):
+        """Draw defined zones on frame"""
+        colors = {
+            'stop_line': (0, 0, 255),      # Red
+            'no_parking': (255, 0, 0),     # Blue
+            'heavy_vehicle_prohibited': (0, 255, 255),  # Yellow
+            'lane': (0, 255, 0),           # Green
+            'lane_zone': (255, 150, 0),    # Orange
+            'no_lane_change': (255, 0, 255) # Magenta
+        }
+        
+        for zone_id, zone_data in self.zone_manager.zones.items():
+            zone_type = zone_data['type']
+            points = zone_data['points']
+            color = colors.get(zone_type, (128, 128, 128))
+            
+            # Draw zone boundary
+            pts = np.array(points, np.int32)
+            pts = pts.reshape((-1, 1, 2))
+            cv2.polylines(frame, [pts], True, color, 2)
+            
+            # Add zone label
+            if points:
+                label_pos = (points[0][0], points[0][1] - 10)
+                cv2.putText(frame, f"{zone_type}_{zone_id}", label_pos, 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+    
+    def draw_detection(self, frame: np.ndarray, detection: DetectionResult):
+        """Draw detection bounding box and info"""
+        x1, y1, x2, y2 = detection.bbox
+        
+        # Choose color based on object type
+        colors = {
+            'car': (255, 0, 0),
+            'motorcycle': (0, 255, 0),
+            'bus': (0, 0, 255),
+            'truck': (255, 255, 0),
+            'person': (255, 0, 255),
+            'bicycle': (0, 255, 255),
+            'traffic light': (128, 128, 128)
+        }
+        color = colors.get(detection.class_name, (255, 255, 255))
+        
+        # Draw bounding box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        
+        # Draw label
+        label = f"{detection.class_name}"
+        if detection.track_id:
+            label += f" ID:{detection.track_id}"
+        label += f" {detection.confidence:.2f}"
+        
+        # Add attribute info
+        if detection.attributes:
+            attr_info = []
+            for key, value in detection.attributes.items():
+                if isinstance(value, bool):
+                    if value:
+                        attr_info.append(key.replace('_detected', '').replace('_', ' '))
+                elif isinstance(value, (int, float)):
+                    attr_info.append(f"{key}: {value}")
+            
+            if attr_info:
+                label += f" [{', '.join(attr_info)}]"
+        
+        # Draw label background
+        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+        cv2.rectangle(frame, (x1, y1 - label_size[1] - 10), 
+                     (x1 + label_size[0], y1), color, -1)
+        
+        # Draw label text
+        cv2.putText(frame, label, (x1, y1 - 5), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Trajectory drawing removed as requested
+    
+    def draw_violation(self, frame: np.ndarray, violation: ViolationEvent):
+        """Draw violation indicator"""
+        x, y = violation.location
+        
+        # Draw violation marker
+        cv2.circle(frame, (int(x), int(y)), 20, (0, 0, 255), 3)
+        cv2.putText(frame, "VIOLATION", (int(x) - 40, int(y) - 25), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        # Draw violation type
+        cv2.putText(frame, violation.violation_type.replace('_', ' ').title(), 
+                   (int(x) - 40, int(y) + 40), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+    
+    def draw_system_info(self, frame: np.ndarray):
+        """Draw system information overlay"""
+        height, width = frame.shape[:2]
+        
+        # System info panel
+        info_panel = np.zeros((180, 300, 3), dtype=np.uint8)
+        
+        # FPS
+        cv2.putText(info_panel, f"FPS: {self.current_fps:.1f}", (10, 25), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        
+        # Frame count
+        cv2.putText(info_panel, f"Frames: {self.frame_count}", (10, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        
+        # Total violations
+        cv2.putText(info_panel, f"Violations: {self.total_violations}", (10, 75), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        
+        # Average processing time
+        if self.detection_times:
+            avg_time = sum(self.detection_times) / len(self.detection_times)
+            cv2.putText(info_panel, f"Avg Time: {avg_time*1000:.1f}ms", (10, 100), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        
+        # Active detectors
+        active_detectors = sum(1 for d in VIOLATION_DETECTORS.values() if d.enabled)
+        cv2.putText(info_panel, f"Active Detectors: {active_detectors}", (10, 125), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        
+        # List active detectors
+        active_detector_names = [d.name for d in VIOLATION_DETECTORS.values() if d.enabled]
+        active_text = ", ".join(active_detector_names)
+        if len(active_text) > 40:  # Truncate if too long
+            active_text = active_text[:37] + "..."
+        cv2.putText(info_panel, f"Types: {active_text}", (10, 150), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        # Overlay info panel on frame
+        frame[10:190, width-310:width-10] = info_panel
+    
+    def update_fps(self):
+        """Update FPS counter"""
+        self.fps_counter += 1
+        current_time = time.time()
+        
+        if current_time - self.last_fps_time >= 1.0:
+            self.current_fps = self.fps_counter / (current_time - self.last_fps_time)
+            self.fps_counter = 0
+            self.last_fps_time = current_time
+    
+    def run(self, display: bool = True, save_output: bool = False, output_path: str = None):
+        """Run the traffic violation detection system"""
+        if not self.initialize():
+            return False
+        
+        self.running = True
+        logger.info("Starting traffic violation detection...")
+        
+        # Setup video writer if saving output
+        video_writer = None
+        if save_output and output_path:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(output_path, fourcc, 20.0, (1280, 720))
+        
+        # Calculate frame delay for proper playback speed
+        target_fps = self.video_processor.fps if self.video_processor.fps > 0 else 30
+        frame_delay = 1.0 / target_fps  # Time between frames in seconds
+        
+        try:
+            while self.running:
+                frame_start_time = time.time()
+                
+                # Read frame
+                frame = self.video_processor.read_frame()
+                if frame is None:
+                    logger.info("End of video stream")
+                    break
+                
+                # Process frame
+                annotated_frame, violations = self.process_frame(frame)
+                
+                # Update counters
+                self.frame_count += 1
+                self.update_fps()
+                
+                # Log violations
+                for violation in violations:
+                    logger.warning(f"VIOLATION: {violation.violation_type} - Track {violation.track_id}")
+                
+                # Display frame
+                if display:
+                    cv2.imshow('Traffic Violation Detection', annotated_frame)
+                    
+                    # Calculate wait time for proper frame rate
+                    processing_time = time.time() - frame_start_time
+                    wait_time = max(1, int((frame_delay - processing_time) * 1000))  # Convert to milliseconds
+                    
+                    # Handle key presses with proper timing
+                    key = cv2.waitKey(wait_time) & 0xFF
+                    if key == ord('q'):
+                        logger.info("Quit requested by user")
+                        break
+                    elif key == ord('s'):
+                        # Save current frame
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        cv2.imwrite(f"violation_frame_{timestamp}.jpg", annotated_frame)
+                        logger.info(f"Frame saved as violation_frame_{timestamp}.jpg")
+                else:
+                    # If not displaying, still maintain frame rate for processing consistency
+                    processing_time = time.time() - frame_start_time
+                    if processing_time < frame_delay:
+                        time.sleep(frame_delay - processing_time)
+                
+                # Save to video file
+                if video_writer:
+                    # Resize frame to match video writer dimensions
+                    resized_frame = cv2.resize(annotated_frame, (1280, 720))
+                    video_writer.write(resized_frame)
+                
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+        except Exception as e:
+            logger.error(f"Error during processing: {e}")
+        finally:
+            self.cleanup(video_writer)
+        
+        return True
+    
+    def cleanup(self, video_writer=None):
+        """Cleanup resources"""
+        self.running = False
+        self.video_processor.release()
+        
+        if video_writer:
+            video_writer.release()
+        
+        cv2.destroyAllWindows()
+        
+        # Print final statistics
+        self.print_statistics()
+    
+    def print_statistics(self):
+        """Print system statistics"""
+        logger.info("=== SYSTEM STATISTICS ===")
+        logger.info(f"Total frames processed: {self.frame_count}")
+        logger.info(f"Total violations detected: {self.total_violations}")
+        logger.info(f"Average FPS: {self.current_fps:.2f}")
+        
+        if self.detection_times:
+            avg_time = sum(self.detection_times) / len(self.detection_times)
+            logger.info(f"Average processing time: {avg_time*1000:.2f}ms")
+        
+        # Violation breakdown
+        violation_counts = {}
+        for violation in self.violations:
+            violation_type = violation.violation_type
+            violation_counts[violation_type] = violation_counts.get(violation_type, 0) + 1
+        
+        logger.info("Violation breakdown:")
+        for violation_type, count in violation_counts.items():
+            logger.info(f"  {violation_type}: {count}")
+        
+        # Detector statistics
+        logger.info("Detector statistics:")
+        for name, detector in VIOLATION_DETECTORS.items():
+            status = "Enabled" if detector.enabled else "Disabled"
+            logger.info(f"  {detector.name}: {status} - {detector.violation_count} violations")
+
+def main():
+    """Main function"""
+    parser = argparse.ArgumentParser(description='Real-time Traffic Violation Detection System')
+    parser.add_argument('--source', type=str, default='0', 
+                       help='Video source (0 for webcam, path for video file)')
+    parser.add_argument('--config', type=str, 
+                       help='Configuration file path')
+    parser.add_argument('--no-display', action='store_true', 
+                       help='Run without display (headless mode)')
+    parser.add_argument('--save-output', type=str, 
+                       help='Save annotated video to file')
+    
+    args = parser.parse_args()
+    
+    # Convert source to int if it's a digit (webcam)
+    source = args.source
+    if source.isdigit():
+        source = int(source)
+    
+    # Create and run system
+    system = TrafficViolationSystem(
+        video_source=source,
+        config_file=args.config
+    )
+    
+    success = system.run(
+        display=not args.no_display,
+        save_output=bool(args.save_output),
+        output_path=args.save_output
+    )
+    
+    if success:
+        logger.info("System completed successfully")
+    else:
+        logger.error("System failed to run")
+        return 1
+    
+    return 0
+
+if __name__ == "__main__":
+    exit(main())
