@@ -78,14 +78,18 @@ python simple_zone_drawer.py
 ### Detection System
 ```bash
 # Basic usage
-python main_app.py --video dataset/traffic.mp4
+python main_app.py --source dataset/traffic.mp4
 
 # Headless mode (no display)
-python main_app.py --video dataset/traffic.mp4 --no-display
+python main_app.py --source dataset/traffic.mp4 --no-display
 
 # Custom configuration
-python main_app.py --video dataset/traffic.mp4 --config custom_config.json
+python main_app.py --source dataset/traffic.mp4 --config custom_config.json
+
+
 ```
+
+
 
 ## 🔍 Detection Algorithms
 
@@ -104,6 +108,8 @@ python main_app.py --video dataset/traffic.mp4 --config custom_config.json
 - **Trajectory Analysis** - Vehicle path monitoring
 - **Lane Boundary Recognition** - Automated lane detection
 - **Illegal Movement Identification** - Unsafe lane switching detection
+
+
 
 ## 🌐 Web Dashboard
 

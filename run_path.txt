@@ -1,2 +1,5 @@
 python3 /home/vmukti/Downloads/Manus_traffic/main_app.py --source /home/vmukti/Downloads/Manus_traffic/tr.mp4 --config config.json
 python3 simple_zone_drawer.py --source /home/vmukti/Downloads/Manus_traffic/dataset/Parking.mp4 --output config.json
+
+
+do one thing for lane change I will not draw polygon we will just draw the line and if the car crosses that line than that car will be capture 

@@ -134,8 +134,8 @@ class VideoProcessor:
 class ObjectDetector:
     """Unified object detection using YOLO"""
     
-    def __init__(self, model_path: str = "yolov8n.pt"):
-        """Initialize YOLO detector"""
+    def __init__(self, model_path: str = "yolo11n.pt"):
+        """Initialize YOLO11 detector"""
         self.model = YOLO(model_path)
         self.class_names = self.model.names
         
@@ -161,7 +161,7 @@ class ObjectDetector:
                     class_name = self.class_names[class_id]
                     
                     # Filter for traffic-relevant objects
-                    if confidence > 0.3 and class_name in ['car', 'motorcycle', 'bus', 'truck', 'person', 'bicycle', 'traffic light']:
+                    if confidence > 0.6 and class_name in ['rickshaw','car', 'motorcycle', 'bus', 'truck', 'person', 'bicycle', 'traffic light','bicycle', 'e-bike', 'jeep', 'motorcycle', 'tricycle','van']:
                         detection = DetectionResult(
                             bbox=(int(x1), int(y1), int(x2), int(y2)),
                             confidence=float(confidence),
@@ -284,13 +284,22 @@ class ZoneManager:
         self.zones = {}
         
     def add_zone(self, zone_id: str, points: List[Tuple[int, int]], zone_type: str):
-        """Add a polygonal zone"""
-        polygon = Polygon(points)
-        self.zones[zone_id] = {
-            'polygon': polygon,
-            'type': zone_type,
-            'points': points
-        }
+        """Add a zone (polygon or line)"""
+        if zone_type == 'lane_divider':
+            # For lane dividers, store as lines (no polygon needed)
+            self.zones[zone_id] = {
+                'polygon': None,
+                'type': zone_type,
+                'points': points
+            }
+        else:
+            # For other zones, create polygon
+            polygon = Polygon(points)
+            self.zones[zone_id] = {
+                'polygon': polygon,
+                'type': zone_type,
+                'points': points
+            }
         logger.info(f"Added {zone_type} zone: {zone_id}")
     
     def point_in_zone(self, point: Tuple[int, int], zone_id: str) -> bool:
@@ -298,8 +307,13 @@ class ZoneManager:
         if zone_id not in self.zones:
             return False
         
+        zone_data = self.zones[zone_id]
+        if zone_data['type'] == 'lane_divider':
+            # Lane dividers don't contain points, they are crossed
+            return False
+        
         point_geom = Point(point)
-        return self.zones[zone_id]['polygon'].contains(point_geom)
+        return zone_data['polygon'].contains(point_geom)
     
     def line_crosses_zone(self, line_points: List[Tuple[int, int]], zone_id: str) -> bool:
         """Check if line crosses zone boundary"""

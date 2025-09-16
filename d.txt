@@ -1,0 +1,12 @@
+#User function Template for python3
+
+class Solution:
+    #Function to check if a is a subset of b.
+    def isSubset(self, a, b):
+        for i in range(len(a))
+            for j in range(len(b))
+                if a[i]==
+    
+    
+    
+    

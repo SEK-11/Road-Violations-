@@ -21,9 +21,9 @@ zone_colors = {
     'lane': (0, 255, 0),           # Green
     'no_parking': (255, 0, 0),     # Blue
     'heavy_vehicle_prohibited': (0, 255, 255),  # Yellow
-    'lane_zone': (255, 150, 0),    # Orange
-    'no_lane_change': (255, 0, 255) # Magenta
+    'lane_divider': (0, 255, 255), # Yellow for lane divider lines
 }
+
 
 def mouse_callback(event, x, y, flags, param):
     """Mouse callback function for drawing zones"""
@@ -35,7 +35,22 @@ def mouse_callback(event, x, y, flags, param):
     
     elif event == cv2.EVENT_LBUTTONUP:
         drawing = False
-        if len(points) > 2:  # Need at least 3 points to form a polygon
+        
+        # For lane dividers, only need 2 points (start and end of line)
+        if current_zone_type == "lane_divider":
+            if len(points) >= 2:
+                # Use only first and last points for a straight line
+                line_points = [points[0], points[-1]]
+                zone_id = f"lane_divider_{len([z for z in zones if z['type'] == current_zone_type]) + 1}"
+                
+                zones.append({
+                    "id": zone_id,
+                    "type": current_zone_type,
+                    "points": line_points
+                })
+                print(f"Added lane divider line: {zone_id}")
+                points = []
+        elif len(points) > 2:  # Need at least 3 points to form a polygon
             # Add the zone
             if current_zone_type == "lane":
                 # For lanes, ask for direction
@@ -50,18 +65,7 @@ def mouse_callback(event, x, y, flags, param):
                     zone_id = f"lane_right_{len([z for z in zones if z['type'] == current_zone_type]) + 1}"
                     
                 print(f"Created {zone_id} - vehicles should move {'left' if 'left' in zone_id else 'right'}")
-            elif current_zone_type == "lane_zone":
-                # For lane zones, ask for lane number
-                print("\nFor lane zones, specify the lane number:")
-                print("1. Lane 1, 2. Lane 2, 3. Lane 3, 4. Lane 4")
-                lane_num = input("Enter lane number (1-4, default is 1): ").strip()
-                
-                if lane_num in ['1', '2', '3', '4']:
-                    zone_id = f"lane_zone_{lane_num}"
-                else:
-                    zone_id = f"lane_zone_1"  # Default
-                    
-                print(f"Created {zone_id}")
+
             else:
                 zone_id = f"{current_zone_type}_{len([z for z in zones if z['type'] == current_zone_type]) + 1}"
             
@@ -84,16 +88,29 @@ def draw_zones(img):
     # Draw current points being drawn
     if len(points) > 1:
         color = zone_colors.get(current_zone_type, (255, 255, 255))
-        pts = np.array(points, np.int32)
-        pts = pts.reshape((-1, 1, 2))
-        cv2.polylines(result, [pts], False, color, 2)
+        
+        if current_zone_type == "lane_divider":
+            # For lane dividers, draw a straight line from first to last point
+            cv2.line(result, points[0], points[-1], color, 3)
+        else:
+            # For other zones, draw as polygon
+            pts = np.array(points, np.int32)
+            pts = pts.reshape((-1, 1, 2))
+            cv2.polylines(result, [pts], False, color, 2)
     
     # Draw existing zones
     for zone in zones:
         color = zone_colors.get(zone['type'], (255, 255, 255))
-        pts = np.array(zone['points'], np.int32)
-        pts = pts.reshape((-1, 1, 2))
-        cv2.polylines(result, [pts], True, color, 2)
+        
+        if zone['type'] == 'lane_divider':
+            # Draw lane divider as a line
+            if len(zone['points']) >= 2:
+                cv2.line(result, zone['points'][0], zone['points'][-1], color, 3)
+        else:
+            # Draw other zones as polygons
+            pts = np.array(zone['points'], np.int32)
+            pts = pts.reshape((-1, 1, 2))
+            cv2.polylines(result, [pts], True, color, 2)
         
         # Add zone label
         if zone['points']:
@@ -105,14 +122,14 @@ def draw_zones(img):
     instructions = [
         "VIDEO IS PAUSED FOR ZONE DRAWING",
         f"Current zone type: {current_zone_type}",
-        "1:stop_line 2:lane 3:no_parking 4:heavy_vehicle 5:lane_zone 6:no_lane_change",
-        "Click and drag to draw a zone",
+        "1:stop_line 2:lane 3:no_parking 4:heavy_vehicle 5:lane_divider",
+        "Click and drag to draw. Press 5 for lane dividers (straight lines)",
         "For lanes, you'll be asked to specify direction (left or right)",
         "Press 's' to save and continue, 'c' to clear points, 'd' to delete last zone"
     ]
     
     # Add background for instructions
-    cv2.rectangle(result, (0, 0), (500, 140), (0, 0, 0), -1)
+    cv2.rectangle(result, (0, 0), (600, 140), (0, 0, 0), -1)
     
     for i, text in enumerate(instructions):
         cv2.putText(result, text, (10, 20 + i * 20), 
@@ -134,7 +151,6 @@ def save_config(output_file):
         "frame_info": frame_info,
         "detectors": {
             "red_light": {"enabled": True},
-            "wrong_side": {"enabled": True},
             "heavy_vehicle": {"enabled": True},
             "parking": {"enabled": True},
             "lane_change": {"enabled": True}
@@ -208,8 +224,9 @@ def main():
     print("2. Draw lanes (for wrong side driving)")
     print("3. Draw no-parking zones")
     print("4. Draw heavy vehicle prohibited zones")
-    print("5. Draw lane zones (for lane change detection - Lane 1, 2, 3, 4)")
-    print("6. Draw no-lane-change zones (areas where lane changes are prohibited)")
+    print("5. Draw lane divider lines (for line-based lane change detection)")
+
+
     print("When finished, press 's' to save and continue to the main application.\n")
     
     # Main loop - stay on the first frame for drawing
@@ -250,11 +267,10 @@ def main():
             current_zone_type = "heavy_vehicle_prohibited"
             print(f"Current zone type: {current_zone_type}")
         elif key == ord('5'):
-            current_zone_type = "lane_zone"
-            print(f"Current zone type: {current_zone_type}")
-        elif key == ord('6'):
-            current_zone_type = "no_lane_change"
-            print(f"Current zone type: {current_zone_type}")
+            current_zone_type = "lane_divider"
+            print(f"Current zone type: {current_zone_type} - Draw lines between lanes")
+
+
     
     # Clean up
     cap.release()
